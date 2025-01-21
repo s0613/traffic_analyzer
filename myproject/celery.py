@@ -1,3 +1,4 @@
+# Celery 설정을 구성하고 Celery 앱을 생성하는 파일
 import os
 from celery import Celery
 

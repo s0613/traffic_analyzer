@@ -1,3 +1,4 @@
+# training.py 파일은 사이트의 응답 시간 데이터를 학습하여 모델을 저장하거나 업데이트하는 기능을 제공합니다.
 import os
 import pandas as pd
 import pickle
@@ -5,6 +6,7 @@ from xgboost import XGBRegressor
 from datetime import timedelta
 from django.utils.timezone import now
 from myapp.models import Site, ResponseTimeLog
+from myproject import settings
 
 
 def train_site_model(site_id):
@@ -42,7 +44,7 @@ def train_site_model(site_id):
 
     # 파일 이름에 사이트 도메인 포함
     safe_domain = site.domain.replace(".", "_")
-    model_path = f"{safe_domain}.pkl"
+    model_path = os.path.join(settings.MODEL_STORAGE_DIR, f"{safe_domain}.pkl")
 
     # 모델 저장
     with open(model_path, 'wb') as f:
@@ -81,7 +83,7 @@ def update_site_model(site_id):
 
     # 기존 모델 로드
     safe_domain = site.domain.replace(".", "_")
-    model_path = f"{safe_domain}_realtime.pkl"
+    model_path = os.path.join(settings.MODEL_STORAGE_DIR, f"{safe_domain}.pkl")
     if not os.path.exists(model_path):
         print(f"[ERROR] Model file not found: {model_path}")
         return None

@@ -1,3 +1,4 @@
+# predict_flow.py: 머신러닝 모델을 사용하여 최적 진입 시간을 예측하는 함수를 정의합니다.
 import os
 import pickle
 import pandas as pd

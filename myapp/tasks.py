@@ -1,139 +1,137 @@
 import random
-import time
+import time as _time
 
+import redis
 import requests
 from celery import shared_task
-from django.utils import timezone
+from django.core.cache import cache
+from django.utils.timezone import now
 
 from myapp.ml.training import train_site_model
-from myapp.models import ResponseTimeLog
-from myapp.models import Site
+from myapp.models import Site, ResponseTimeLog
 
-# 이벤트 모드 및 크롤링 관리 변수
-IS_EVENT_MODE = {}  # 도메인 → 이벤트 모드 활성화 여부
-next_check_time = {}  # 도메인 → 다음 크롤링 예정 시간 (epoch timestamp 값)
+redis_client = redis.StrictRedis(host='localhost', port=6379, db=0)
 
 def normalize_domain_for_db(domain: str) -> str:
-    """
-    DB에서 사용되는 형식으로 도메인을 변환합니다.
-    - https:// 제거
-    - .(점)을 _로 변환
-    """
-    domain = domain.replace("https://", "").replace(".", "_")
-    return domain
+    return domain.replace("https://", "").replace(".", "_")
 
 def denormalize_domain_from_db(domain: str) -> str:
-    """
-    DB에 저장된 도메인을 HTTP 요청에 사용할 형식으로 변환합니다.
-    - _를 .으로 변환
-    - https:// 추가
-    """
-    domain = domain.replace("_", ".")
-    return f"https://{domain}"
+    return f"https://{domain.replace('_', '.')}"
 
-@shared_task
-def set_event_mode(domain: str, enable: bool = True):
-    """
-    특정 도메인의 이벤트 모드를 활성화하거나 비활성화합니다.
-    """
-    normalized_domain = normalize_domain_for_db(domain)
-    IS_EVENT_MODE[normalized_domain] = enable
-    mode_str = "EVENT" if enable else "NORMAL"
-    print(f"[EVENT_MODE] {domain} set to {mode_str} mode.")
+def set_event_mode(mode: str):
+    if mode == "fast":
+        cache.set("FAST_MODE", "1", timeout=60)
+        print("[INFO] Fast mode activated.")
+    elif mode == "regular":
+        cache.set("FAST_MODE", "0")
+        print("[INFO] Regular mode activated.")
+    else:
+        print("[ERROR] Invalid mode specified.")
 
 @shared_task
 def crawl_site(domain: str):
-    """
-    사이트에 GET 요청을 보내고 응답 시간을 DB에 기록합니다.
-    """
-    normalized_domain = normalize_domain_for_db(domain)
-    denormalized_domain = denormalize_domain_from_db(normalized_domain)
+    denormalized_domain = denormalize_domain_from_db(domain)
 
-    t0 = time.time()
     try:
+        t0 = now().timestamp()
         response = requests.get(denormalized_domain, timeout=10)
-        resp_time = time.time() - t0
+        response_time = now().timestamp() - t0
         status_code = response.status_code
-    except requests.RequestException as e:
-        # 실패 시 응답 시간과 에러 로그 기록
-        resp_time = time.time() - t0
+    except requests.exceptions.Timeout:
+        print(f"[ERROR] Timeout while crawling {denormalized_domain}")
+        response_time = -1
         status_code = None
+    except requests.exceptions.SSLError:
+        print(f"[ERROR] SSL error while crawling {denormalized_domain}")
+        response_time = -1
+        status_code = None
+    except requests.RequestException as e:
         print(f"[ERROR] Failed to crawl {denormalized_domain}: {e}")
+        response_time = -1
+        status_code = None
 
-    try:
-        # 정규화된 도메인으로 DB 조회
-        site_obj = Site.objects.get(domain=normalized_domain)
-    except Site.DoesNotExist:
-        print(f"[ERROR] Site not found in DB: {normalized_domain}")
+    site_obj = Site.objects.filter(domain=domain).first()
+    if site_obj:
+        if response_time != -1:  # Only log valid response times
+            ResponseTimeLog.objects.create(
+                site=site_obj,
+                timestamp=now(),
+                response_time=round(response_time, 3)
+            )
+            print(f"[CRAWL] {denormalized_domain} => {response_time:.3f}s (status: {status_code})")
+        else:
+            print(f"[CRAWL] {denormalized_domain} => Failed to crawl")
+    else:
+        print(f"[ERROR] Site not found for domain: {domain}")
+
+@shared_task
+def deactivate_fast_mode(site_id: int):
+    set_event_mode("regular")
+    cache.delete(f"fast_mode_{site_id}")
+    print(f"[INFO] Fast mode deactivated for site {site_id}.")
+
+@shared_task
+def update_predictions_and_train(site_id: int):
+    site = Site.objects.filter(id=site_id, active=True).first()
+    if not site:
+        print(f"[ERROR] Site not found or inactive: {site_id}")
         return
 
-    # 응답 시간을 DB에 기록
-    ResponseTimeLog.objects.create(
-        site=site_obj,
-        timestamp=timezone.now(),
-        response_time=round(resp_time, 3)
-    )
+    release_time = site.release_time
+    current_time = now()
 
-    # 상태 코드는 로그에 기록
-    status_message = f"[CRAWL] {denormalized_domain} => {resp_time:.3f}s"
-    if status_code:
-        status_message += f" (status: {status_code})"
-    print(status_message)
+    if not release_time or current_time >= release_time:
+        print(f"[INFO] Release time has passed or not set for site: {site.domain}")
+        return
 
-# 전역 변수로 상태 관리
-IS_FAST_MODE = False
+    domain = normalize_domain_for_db(site.domain)
 
-@shared_task
-def best_entry_time_api_received():
-    """
-    API 요청을 처리하여 크롤링 속도를 2초로 변경하고 ML Training 속도를 10초로 설정합니다.
-    """
-    global IS_FAST_MODE
-    IS_FAST_MODE = True
-    print("[INFO] Fast mode activated. Crawling every 2 seconds, ML training every 10 seconds.")
+    for _ in range(6):
+        crawl_site(domain)  # 크롤링 수행
+        print(f"[INFO] Re-training model for site: {site.domain}")
+        train_site_model.delay(site.id)  # 비동기적으로 모델 학습
+        _time.sleep(10)
 
-    # Fast mode는 1분 후 자동 복구
-    restore_default_mode.apply_async(countdown=60)
+    print(f"[INFO] Completed fast-mode crawling and training for site: {site.domain}")
 
 @shared_task
-def restore_default_mode():
-    """
-    Fast mode 복구: 크롤링 10초, ML 학습 하루 1회로 복구.
-    """
-    global IS_FAST_MODE
-    IS_FAST_MODE = False
-    print("[INFO] Restored default mode. Crawling every 10 seconds, ML training daily.")
+def schedule_regular_crawling():
+    if cache.get("FAST_MODE") == "1":
+        print("[INFO] Fast mode is active. Skipping regular crawling.")
+        return
 
-@shared_task
-def schedule_crawl_task():
-    """
-    랜덤 간격으로 각 사이트를 크롤링
-    - 이벤트 모드: 5~15초
-    - 기본 모드: 60~180초
-    """
-    now = timezone.now()
-    active_sites = Site.objects.filter(active=True)
-
-    for site_obj in active_sites:
-        domain = site_obj.domain
-        if domain not in next_check_time:
-            delay_sec = random.uniform(5, 15) if IS_EVENT_MODE.get(domain, False) else random.uniform(60, 180)
-            next_check_time[domain] = now.timestamp() + delay_sec
-
-        if now.timestamp() >= next_check_time[domain]:
-            crawl_site.delay(domain)
-            delay_sec = random.uniform(5, 15) if IS_EVENT_MODE.get(domain, False) else random.uniform(60, 180)
-            next_check_time[domain] = now.timestamp() + delay_sec
-
-@shared_task
-def train_ml_model():
-    """
-    ML 학습 태스크를 동적으로 관리합니다.
-    """
-    global IS_FAST_MODE
     sites = Site.objects.filter(active=True)
-
     for site in sites:
-        train_site_model(site.id)  # 각 사이트의 ML 모델 학습
+        domain = normalize_domain_for_db(site.domain)
+        delay = random.uniform(60, 180)
+        print(f"[SCHEDULE] Next crawl for {domain} in {delay:.1f} seconds.")
+        crawl_site.apply_async(args=[domain], countdown=delay)
 
-    print(f"[INFO] ML 모델 학습 완료 in {'fast' if IS_FAST_MODE else 'default'} mode.")
+@shared_task
+def daily_train_models():
+    sites = Site.objects.filter(active=True)
+    for site in sites:
+        try:
+            print(f"[INFO] Training model for site: {site.domain}")
+            train_site_model(site.id)
+        except Exception as e:
+            print(f"[ERROR] Failed to train model for site {site.domain}: {e}")
+            continue
+
+    print("[INFO] Completed daily model training for all sites.")
+
+@shared_task
+def activate_fast_mode(site_id: int):
+    if cache.get("FAST_MODE") == "1":
+        print("[INFO] Fast mode is already activated.")
+        return
+
+    set_event_mode("fast")
+    update_predictions_and_train.delay(site_id)
+    print(f"[INFO] Fast mode activated for site {site_id}.")
+
+@shared_task
+def deactivate_fast_mode():
+    set_event_mode("regular")
+    cache.delete("FAST_MODE")
+    print("[INFO] Fast mode deactivated.")

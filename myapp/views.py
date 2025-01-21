@@ -1,4 +1,6 @@
+#views.py
 import json
+import threading
 
 from django.shortcuts import render, redirect, get_object_or_404
 from django.http import JsonResponse
@@ -6,29 +8,19 @@ from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework import status
-
-from myapp.tasks import set_event_mode
-from .models import Site
-from .forms import AddSiteForm
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from django.utils.dateparse import parse_datetime
+from django.utils import timezone
+from django.contrib.auth import authenticate
+from tasks import set_event_mode, deactivate_fast_mode
+from .models import Site
+from .forms import AddSiteForm
 from myapp.ml.rolling_predict import find_best_entry_time
 from rest_framework.views import APIView
-from django.contrib.auth import authenticate
-
-from django.utils import timezone
-
+from django.core.cache import cache
 @api_view(['POST'])
 def best_entry_time_api(request):
-    """
-    최적 진입 시점 API
-    POST 요청 예:
-    {
-        "site_id": 3,
-        "release_time": "2025-01-16T10:00:00"
-    }
-    """
     site_id = request.data.get('site_id')
     release_time_str = request.data.get('release_time')
 
@@ -42,7 +34,6 @@ def best_entry_time_api(request):
     if not release_time:
         return Response({"error": "올바르지 않은 시간 형식입니다."}, status=400)
 
-    # release_time이 naive datetime 객체라면 현재 타임존을 적용하여 aware로 변환
     if timezone.is_naive(release_time):
         release_time = timezone.make_aware(release_time, timezone.get_current_timezone())
 
@@ -50,14 +41,24 @@ def best_entry_time_api(request):
     current_time_kst = current_time.astimezone(timezone.get_current_timezone())
     release_time_kst = release_time.astimezone(timezone.get_current_timezone())
 
-    # 서울 기준으로 현재 시간과 릴리즈 시간 로그 출력
-    print(f"현재 시간 (KST): {current_time_kst.strftime('%H시 %M분')}")
-    print(f"릴리즈 시간 (KST): {release_time_kst.strftime('%H시 %M분')}")
+    # 빠른 모드 중복 체크
+    if cache.get(f"fast_mode_{site_id}"):
+        return Response({"message": "현재 빠른 모드가 활성화되어 있습니다. 잠시 후 다시 시도해주세요."}, status=400)
 
     optimal_time = find_best_entry_time(site_id, current_time_kst, release_time_kst)
 
     if optimal_time:
         formatted_time = optimal_time.strftime("%H시 %M분 %S초")
+
+        # Redis에 빠른 모드 활성화 (1분)
+        cache.set(f"fast_mode_{site_id}", True, timeout=60)
+
+        # 비동기 태스크 호출
+        set_event_mode.delay(site_id, enable=True)
+
+        # 타이머를 설정하여 10초 후 자동으로 일반 모드로 전환
+        threading.Timer(10.0, deactivate_fast_mode, args=[site_id]).start()
+
         return Response({
             "optimal_time": optimal_time.isoformat(),
             "message": f"{formatted_time}에 진입하세요."
@@ -67,63 +68,48 @@ def best_entry_time_api(request):
             "optimal_time": None,
             "message": "최적 진입 시간을 찾을 수 없습니다."
         })
-
-
+# 새 사이트 추가 폼
 def add_site(request):
-    """
-    새 사이트 추가 폼
-    """
     if request.method == "POST":
         form = AddSiteForm(request.POST)
         if form.is_valid():
             domain = form.cleaned_data['domain']
             name = form.cleaned_data['name']
             site_obj, created = Site.objects.get_or_create(domain=domain, defaults={"name": name, "active": True})
-            return redirect('site_list')  # 사이트 리스트 페이지로 이동
+            return redirect('site_list')
     else:
         form = AddSiteForm()
 
     return render(request, 'add_site.html', {"form": form})
 
-
-
+# 사이트 목록 가져오기
 def get_sites(request):
-    """
-    Returns a list of active sites.
-    """
     sites = Site.objects.filter(active=True).values("domain", "name")
     return JsonResponse({"sites": list(sites)})
 
+# 사이트 리스트 페이지
 def site_list(request):
-    """
-    등록된 사이트 목록 표시
-    """
     sites = Site.objects.all()
     return render(request, 'site_list.html', {"sites": sites})
 
+# 이벤트 모드 토글
 def toggle_event_mode(request, site_id):
-    """
-    특정 사이트의 이벤트 모드를 토글(활성화/비활성화)
-    """
     site = get_object_or_404(Site, id=site_id)
-    is_active = site.active  # 현재 활성화 상태
+    is_active = site.active
     site.active = not is_active
     site.save()
 
-    # Celery 태스크를 호출하여 이벤트 모드 설정
+    # 비동기 태스크 호출
     set_event_mode.delay(site.domain, enable=site.active)
 
     message = f"{site.domain}의 이벤트 모드가 {'활성화' if site.active else '비활성화'}되었습니다."
     if request.is_ajax():
         return JsonResponse({"message": message, "active": site.active})
     else:
-        return redirect('site_list')  # 사이트 리스트 페이지로 리다이렉트
+        return redirect('site_list')
 
+# 사이트 세부 정보 페이지
 def site_detail(request, site_id):
-    """
-    사이트 세부 정보 페이지
-    - 발매 시간 설정 및 예측 진행 UI 제공
-    """
     site = get_object_or_404(Site, id=site_id)
 
     if request.method == "POST":
@@ -154,6 +140,7 @@ def site_detail(request, site_id):
 
     return render(request, "site_detail.html", {"site": site})
 
+# 로그인 API
 class LoginView(APIView):
     def post(self, request, *args, **kwargs):
         email = request.data.get('email')
@@ -163,14 +150,14 @@ class LoginView(APIView):
             return Response({"message": "Login successful"}, status=200)
         return Response({"error": "Invalid credentials"}, status=401)
 
-
+# URL 추가 API
 @method_decorator(csrf_exempt, name='dispatch')
 class AddURLView(View):
     def post(self, request, *args, **kwargs):
         try:
             data = json.loads(request.body)
             domain = data.get('domain')
-            name = data.get('name', domain)  # 이름이 없으면 도메인을 기본값으로 사용
+            name = data.get('name', domain)
 
             if not domain:
                 return JsonResponse({"error": "Domain is required."}, status=400)
