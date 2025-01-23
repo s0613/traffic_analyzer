@@ -8,12 +8,38 @@ from django.utils.timezone import now
 from myapp.ml.training import train_site_model
 from myapp.models import Site, ResponseTimeLog
 
+# Redis 클라이언트 설정
 redis_client = redis.StrictRedis(host='localhost', port=6379, db=0)
 
+# 프록시 리스트
+PROXY_LIST = [
+    "134.195.230.206:5725",
+    "134.195.231.33:5988",
+    "216.185.223.54:5577",
+    "134.195.229.107:6176",
+    "216.185.221.79:6781"
+]
+
+# 프록시 인증 정보
+PROXY_AUTH = {
+    "username": "ANPU229576",
+    "password": "BCDLMW39"
+}
+
+def get_random_proxy():
+    """랜덤으로 프록시를 선택하고 인증 정보를 포함한 프록시 URL을 반환합니다."""
+    proxy = random.choice(PROXY_LIST)
+    return {
+        "http": f"http://{PROXY_AUTH['username']}:{PROXY_AUTH['password']}@{proxy}",
+        "https": f"http://{PROXY_AUTH['username']}:{PROXY_AUTH['password']}@{proxy}"
+    }
+
 def normalize_domain_for_db(domain: str) -> str:
+    """도메인을 데이터베이스에 저장하기 위해 정규화합니다."""
     return domain.replace("https://", "").replace(".", "_")
 
 def denormalize_domain_from_db(domain: str) -> str:
+    """데이터베이스에서 도메인을 원래 형식으로 복원합니다."""
     return f"https://{domain.replace('_', '.')}"
 
 @shared_task
@@ -30,10 +56,13 @@ def set_event_mode(site_domain: str, enable: bool):
 
 @shared_task
 def crawl_site(domain: str):
+    """프록시를 사용하여 사이트를 크롤링하고 응답 시간을 기록합니다."""
     denormalized_domain = denormalize_domain_from_db(domain)
+    proxies = get_random_proxy()  # 랜덤 프록시 선택
+
     try:
         t0 = now().timestamp()
-        response = requests.get(denormalized_domain, timeout=10)
+        response = requests.get(denormalized_domain, timeout=10, proxies=proxies)
         response_time = now().timestamp() - t0
         status_code = response.status_code
     except requests.exceptions.Timeout:
@@ -51,7 +80,7 @@ def crawl_site(domain: str):
 
     site_obj = Site.objects.filter(domain=domain).first()
     if site_obj:
-        if response_time != -1:  # Only log valid response times
+        if response_time != -1:  # 유효한 응답 시간만 기록
             ResponseTimeLog.objects.create(
                 site=site_obj,
                 timestamp=now(),
