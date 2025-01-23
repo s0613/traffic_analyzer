@@ -1,19 +1,21 @@
-# training.py 파일은 사이트의 응답 시간 데이터를 학습하여 모델을 저장하거나 업데이트하는 기능을 제공합니다.
 import os
 import pandas as pd
 import pickle
+
+from celery import shared_task
 from xgboost import XGBRegressor
 from datetime import timedelta
 from django.utils.timezone import now
+from django.shortcuts import get_object_or_404
 from myapp.models import Site, ResponseTimeLog
 from myproject import settings
 
-
-def train_site_model(site_id):
+@shared_task
+def train_site_model(site_domain):
     """
-    특정 사이트의 로그 데이터를 학습하여 모델 저장 (사이트 이름 기반)
+    특정 사이트의 로그 데이터를 학습하여 모델 저장 (사이트 도메인 기반)
     """
-    site = Site.objects.get(id=site_id)
+    site = get_object_or_404(Site, domain=site_domain)
     logs = ResponseTimeLog.objects.filter(site=site).order_by('timestamp')
 
     # 최소 데이터 갯수 확인
@@ -43,7 +45,7 @@ def train_site_model(site_id):
     model.fit(X_train, y_train)
 
     # 파일 이름에 사이트 도메인 포함
-    safe_domain = site.domain.replace(".", "_")
+    safe_domain = site_domain.replace(".", "_")
     model_path = os.path.join(settings.MODEL_STORAGE_DIR, f"{safe_domain}.pkl")
 
     # 모델 저장
@@ -54,11 +56,11 @@ def train_site_model(site_id):
     return model
 
 
-def update_site_model(site_id):
+def update_site_model(site_domain):
     """
     기존 모델에 최근 1분 데이터를 추가 학습
     """
-    site = Site.objects.get(id=site_id)
+    site = get_object_or_404(Site, domain=site_domain)
     logs = ResponseTimeLog.objects.filter(
         site=site,
         timestamp__gte=now() - timedelta(minutes=1)
@@ -82,7 +84,7 @@ def update_site_model(site_id):
     y = df['response_time']
 
     # 기존 모델 로드
-    safe_domain = site.domain.replace(".", "_")
+    safe_domain = site_domain.replace(".", "_")
     model_path = os.path.join(settings.MODEL_STORAGE_DIR, f"{safe_domain}.pkl")
     if not os.path.exists(model_path):
         print(f"[ERROR] Model file not found: {model_path}")

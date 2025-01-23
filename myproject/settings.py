@@ -44,7 +44,9 @@ CELERY_BROKER_URL = 'redis://localhost:6379/0'
 CELERY_RESULT_BACKEND = 'django-db'
 CELERY_TIMEZONE = 'Asia/Seoul'
 CELERY_ENABLE_UTC = False
-
+CELERY_BROKER_TRANSPORT_OPTIONS = {
+    'parser_class': 'redis.connection.PythonParser',  # 기본 파서 사용
+}
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
 ]
@@ -86,6 +88,7 @@ DATABASES = {
         "NAME": BASE_DIR / "db.sqlite3",
     }
 }
+
 
 AUTH_PASSWORD_VALIDATORS = [
     {

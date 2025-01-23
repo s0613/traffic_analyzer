@@ -1,22 +1,26 @@
-#rolling_predict.py
 import os
 import pickle
-import pandas as pd
 from datetime import timedelta
-from django.utils.timezone import now
+
+import pandas as pd
 from django.shortcuts import get_object_or_404
+
 from myapp.models import ResponseTimeLog, Site
+from myproject import settings
+
 
 def load_site_model(site_domain):
     """
     저장된 모델 파일 로드
     """
-    model_path = f"{site_domain}.pkl"
+    safe_domain = site_domain.replace(".", "_")
+    model_path = os.path.join(settings.MODEL_STORAGE_DIR, f"{safe_domain}.pkl")
     if not os.path.exists(model_path):
         print(f"[ERROR] Model file not found: {model_path}")
         return None
     with open(model_path, 'rb') as f:
         return pickle.load(f)
+
 
 def get_rolling_stats(site_domain, t, window_seconds=60):
     """
@@ -40,6 +44,7 @@ def get_rolling_stats(site_domain, t, window_seconds=60):
         sum((x - rolling_mean) ** 2 for x in response_times) / len(response_times)
     ) ** 0.5
     return rolling_mean, rolling_std
+
 
 def find_best_entry_time(site_domain, current_time, release_time):
     """
