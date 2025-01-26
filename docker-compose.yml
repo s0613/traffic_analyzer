@@ -1,61 +1,48 @@
-version: "3.9"
+version: '3.8'
 
 services:
-  web:
+  django:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: django_app
-    command: >
-      sh -c "python manage.py migrate &&
-             python manage.py runserver 0.0.0.0:8000"
-    ports:
-      - "8000:8000"
+    command: sh start_project.sh
     volumes:
       - .:/app
+    ports:
+      - "8000:8000"
     depends_on:
       - redis
-      - db
     environment:
-      - DEBUG=1
       - CELERY_BROKER_URL=redis://redis:6379/0
+      - DJANGO_SETTINGS_MODULE=myproject.settings
 
   redis:
-    image: redis:6.2
+    image: redis:alpine
     container_name: redis
     ports:
       - "6379:6379"
 
-  db:
-    image: postgres:14
-    container_name: postgres_db
-    environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: myproject
-    ports:
-      - "5432:5432"
-
   celery_worker:
     build:
       context: .
+      dockerfile: Dockerfile
     container_name: celery_worker
-    command: celery -A myproject worker --loglevel=info
+    command: celery -A myproject worker --loglevel=info --pool=solo
     depends_on:
       - redis
-      - db
     environment:
       - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=django-db
 
   celery_beat:
     build:
       context: .
+      dockerfile: Dockerfile
     container_name: celery_beat
     command: celery -A myproject beat --loglevel=info
     depends_on:
       - redis
-      - db
+    volumes:
+      - ./celerybeat-schedule.db:/app/celerybeat-schedule.db
     environment:
       - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/0
